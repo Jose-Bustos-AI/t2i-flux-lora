@@ -15,16 +15,15 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------------------------
-# Config
-# -------------------------
 server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1")
 client_id = str(uuid.uuid4())
 
-COMFY_ROOT = os.getenv("COMFY_ROOT", "/comfyui")
+# Mantengo /ComfyUI porque tu repo venía así
+COMFY_ROOT = os.getenv("COMFY_ROOT", "/ComfyUI")
+COMFY_OUTPUT_DIR = os.path.join(COMFY_ROOT, "output")
 LORAS_DIR = os.path.join(COMFY_ROOT, "models", "loras")
 
-HANDLER_VERSION = os.getenv("HANDLER_VERSION", "t2i-flux1dev-lora-supabase-v1")
+HANDLER_VERSION = os.getenv("HANDLER_VERSION", "t2i-flux-dev-fp8-lora-supabase-v1")
 print(f"HANDLER VERSION: {HANDLER_VERSION}", flush=True)
 
 DEFAULT_CHECKPOINT = os.getenv("FLUX_CHECKPOINT", "flux1-dev-fp8.safetensors")
@@ -54,40 +53,18 @@ def supabase_upload_bytes(content: bytes, filename: str, content_type: str = "im
 
     return f"{supabase_url}/storage/v1/object/public/{bucket}/{path}"
 
-
 # -------------------------
-# Helpers
+# Comfy helpers
 # -------------------------
-def to_nearest_multiple_of_16(value):
-    try:
-        v = float(value)
-    except Exception:
-        raise Exception(f"width/height no es numérico: {value}")
-    adjusted = int(round(v / 16.0) * 16)
-    return max(adjusted, 16)
-
-
-def _pick_seed(seed_val):
-    try:
-        if seed_val is None:
-            return random.randint(0, 2**31 - 1)
-        s = int(seed_val)
-        return random.randint(0, 2**31 - 1) if s < 0 else s
-    except Exception:
-        return random.randint(0, 2**31 - 1)
-
-
 def _ensure_comfy_ready():
     http_url = f"http://{server_address}:8188/"
     for i in range(180):
         try:
             urllib.request.urlopen(http_url, timeout=5)
-            logger.info("ComfyUI HTTP ready")
             return
         except Exception:
             time.sleep(1)
     raise Exception("ComfyUI no responde en 8188")
-
 
 def _connect_ws():
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
@@ -95,12 +72,10 @@ def _connect_ws():
     for i in range(36):
         try:
             ws.connect(ws_url)
-            logger.info("ComfyUI WS connected")
             return ws
         except Exception:
             time.sleep(5)
     raise Exception("WS timeout")
-
 
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
@@ -117,12 +92,10 @@ def queue_prompt(prompt):
             body = "(no body)"
         raise Exception(f"/prompt {e.code}: {body}")
 
-
 def get_history(prompt_id):
     url = f"http://{server_address}:8188/history/{prompt_id}"
     with urllib.request.urlopen(url) as resp:
         return json.loads(resp.read())
-
 
 def wait_until_done(ws, prompt_id):
     while True:
@@ -134,7 +107,6 @@ def wait_until_done(ws, prompt_id):
                 if data.get("node") is None and data.get("prompt_id") == prompt_id:
                     return
 
-
 def comfy_view_download(filename: str, subfolder: str = "", filetype: str = "output") -> bytes:
     qs = urllib.parse.urlencode({
         "filename": filename,
@@ -144,7 +116,6 @@ def comfy_view_download(filename: str, subfolder: str = "", filetype: str = "out
     url = f"http://{server_address}:8188/view?{qs}"
     with urllib.request.urlopen(url) as resp:
         return resp.read()
-
 
 def extract_first_image_ref(history_for_prompt: dict):
     outputs = history_for_prompt.get("outputs", {}) or {}
@@ -156,6 +127,14 @@ def extract_first_image_ref(history_for_prompt: dict):
                     return fn, img.get("subfolder", ""), img.get("type", "output")
     return None
 
+def _pick_seed(seed_val):
+    try:
+        if seed_val is None:
+            return random.randint(0, 2**31 - 1)
+        s = int(seed_val)
+        return random.randint(0, 2**31 - 1) if s < 0 else s
+    except Exception:
+        return random.randint(0, 2**31 - 1)
 
 def ensure_lora(lora_url: str, lora_name: str = None) -> str:
     if not lora_url:
@@ -168,15 +147,14 @@ def ensure_lora(lora_url: str, lora_name: str = None) -> str:
         lora_name = base if base else f"lora_{uuid.uuid4()}.safetensors"
 
     if not lora_name.endswith(".safetensors"):
-        lora_name = lora_name + ".safetensors"
+        lora_name += ".safetensors"
 
     dest_path = os.path.join(LORAS_DIR, lora_name)
 
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
-        logger.info(f"LoRA ya existe: {dest_path}")
         return lora_name
 
-    logger.info(f"Descargando LoRA: {lora_url} -> {dest_path}")
+    logger.info(f"Downloading LoRA: {lora_url} -> {dest_path}")
     with requests.get(lora_url, stream=True, timeout=300) as r:
         if r.status_code != 200:
             raise Exception(f"LoRA download failed: {r.status_code} {r.text[:300]}")
@@ -186,23 +164,24 @@ def ensure_lora(lora_url: str, lora_name: str = None) -> str:
                     f.write(chunk)
 
     if os.path.getsize(dest_path) < 1024:
-        raise Exception("LoRA descargada demasiado pequeña (URL mala?)")
+        raise Exception("LoRA demasiado pequeña (URL mala?)")
 
     return lora_name
 
-
-def build_flux_workflow(prompt_text, negative_text, width, height, steps, cfg, guidance, seed,
-                        checkpoint_name, lora_file=None, lora_strength_model=1.0, lora_strength_clip=1.0):
+def build_flux_fp8_checkpoint_workflow(prompt_text, negative_text, width, height, steps, cfg, seed,
+                                       checkpoint_name, lora_file=None, lora_strength_model=1.0, lora_strength_clip=1.0):
     """
-    Workflow mínimo para FLUX. Requiere que tu ComfyUI tenga nodos FLUX/SD3 disponibles.
+    Workflow CORE para checkpoint FP8:
+    Load Checkpoint -> (LoRA opcional) -> CLIPTextEncode -> EmptyLatentImage -> KSampler -> VAEDecode -> SaveImage
     """
-    N = lambda i: str(i)
     wf = {}
+    def N(i): return str(i)
 
     wf[N(10)] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": checkpoint_name}}
 
     model_ref = [N(10), 0]
     clip_ref = [N(10), 1]
+    vae_ref  = [N(10), 2]
 
     if lora_file:
         wf[N(15)] = {
@@ -221,15 +200,13 @@ def build_flux_workflow(prompt_text, negative_text, width, height, steps, cfg, g
     wf[N(20)] = {"class_type": "CLIPTextEncode", "inputs": {"clip": clip_ref, "text": prompt_text}}
     wf[N(21)] = {"class_type": "CLIPTextEncode", "inputs": {"clip": clip_ref, "text": negative_text}}
 
-    wf[N(30)] = {"class_type": "EmptySD3LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
-
-    wf[N(40)] = {"class_type": "FluxGuidance", "inputs": {"conditioning": [N(20), 0], "guidance": float(guidance)}}
+    wf[N(30)] = {"class_type": "EmptyLatentImage", "inputs": {"width": int(width), "height": int(height), "batch_size": 1}}
 
     wf[N(60)] = {
         "class_type": "KSampler",
         "inputs": {
             "model": model_ref,
-            "positive": [N(40), 0],
+            "positive": [N(20), 0],
             "negative": [N(21), 0],
             "latent_image": [N(30), 0],
             "seed": int(seed),
@@ -241,11 +218,10 @@ def build_flux_workflow(prompt_text, negative_text, width, height, steps, cfg, g
         }
     }
 
-    wf[N(70)] = {"class_type": "VAEDecode", "inputs": {"samples": [N(60), 0], "vae": [N(10), 2]}}
+    wf[N(70)] = {"class_type": "VAEDecode", "inputs": {"samples": [N(60), 0], "vae": vae_ref}}
     wf[N(80)] = {"class_type": "SaveImage", "inputs": {"images": [N(70), 0], "filename_prefix": "runpod_t2i"}}
 
     return wf
-
 
 def handler(job):
     job_input = job.get("input", {}) or {}
@@ -255,15 +231,14 @@ def handler(job):
     if not prompt_text or not isinstance(prompt_text, str):
         raise Exception("Missing required field: prompt (string)")
 
-    negative_text = job_input.get("negative_prompt") or "blurry, lowres, deformed, extra fingers"
+    # Para flux fp8 recomiendan CFG ~ 1.0 :contentReference[oaicite:3]{index=3}
     seed = _pick_seed(job_input.get("seed"))
-
-    width = to_nearest_multiple_of_16(job_input.get("width", 1024))
-    height = to_nearest_multiple_of_16(job_input.get("height", 1024))
-
+    width = int(job_input.get("width", 1024))
+    height = int(job_input.get("height", 1024))
     steps = int(job_input.get("steps", 24))
-    cfg = float(job_input.get("cfg", 1.2))
-    guidance = float(job_input.get("guidance", 3.5))
+    cfg = float(job_input.get("cfg", 1.0))
+
+    negative_text = job_input.get("negative_prompt") or ""
 
     checkpoint = job_input.get("checkpoint") or DEFAULT_CHECKPOINT
 
@@ -274,16 +249,10 @@ def handler(job):
 
     lora_file = ensure_lora(lora_url, lora_name) if lora_url else None
 
-    workflow = job_input.get("workflow")
-    if workflow and isinstance(workflow, dict):
-        prompt_wf = workflow
-        logger.info("Using input.workflow")
-    else:
-        prompt_wf = build_flux_workflow(
-            prompt_text, negative_text, width, height, steps, cfg, guidance, seed,
-            checkpoint, lora_file, lora_strength_model, lora_strength_clip
-        )
-        logger.info("Using built-in FLUX workflow")
+    prompt_wf = build_flux_fp8_checkpoint_workflow(
+        prompt_text, negative_text, width, height, steps, cfg, seed,
+        checkpoint, lora_file, lora_strength_model, lora_strength_clip
+    )
 
     _ensure_comfy_ready()
     ws = _connect_ws()
@@ -318,12 +287,9 @@ def handler(job):
         "height": height,
         "steps": steps,
         "cfg": cfg,
-        "guidance": guidance,
         "checkpoint": checkpoint,
         "lora_name": lora_file or "",
         "version": HANDLER_VERSION
     }
 
-
 runpod.serverless.start({"handler": handler})
-
